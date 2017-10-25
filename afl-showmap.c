@@ -54,6 +54,7 @@ static s32 child_pid;                 /* PID of the tested program         */
 
 static HANDLE child_handle,
               child_thread_handle;
+static HANDLE ex_child_handle, ex_child_thread_handle;
 static char *dynamorio_dir;
 static char *client_params;
 
@@ -86,6 +87,8 @@ static u8  quiet_mode,                /* Hide non-essential messages?      */
            edges_only,                /* Ignore hit counts?                */
            cmin_mode,                 /* Generate output in afl-cmin mode? */
            binary_mode;               /* Write output as a binary map      */
+
+static u8* ext_cmdline;               /* other cmd to run during a fuzz run */
 
 static volatile u8
            stop_soon,                 /* Ctrl-C pressed?                   */
@@ -427,6 +430,26 @@ char *argv_to_cmd(char** argv) {
   return ret;
 }
 
+static void
+do_spawn_extra_process() {
+    char* new_cmdline = alloc_printf(ext_cmdline, out_file);
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+
+    si.cb = sizeof(si);
+
+    if (!CreateProcess(NULL, new_cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
+    }
+
+    ex_child_handle = pi.hProcess;
+    ex_child_thread_handle = pi.hThread;
+
+    ck_free(new_cmdline);
+}
 
 static void create_target_process(char** argv) {
   char* dr_cmd;
@@ -578,6 +601,22 @@ static void destroy_target_process(int wait_exit) {
     child_handle = NULL;
   }
 
+    /* wait for extra child process to terminate */
+    if(ex_child_handle) {
+        if(WaitForSingleObject(ex_child_handle, wait_exit) == WAIT_TIMEOUT) {
+            if (!TerminateProcess(ex_child_handle, 0)) {
+                WARNF("Failed while trying to terminate extra process %d. GLE=%d.\n", GetProcessId(ex_child_handle), GetLastError());
+            } else {
+                if (WaitForSingleObject(ex_child_handle, 20000) == WAIT_TIMEOUT) {
+                    WARNF("Unable to kill extra process %d. GLE=%d.\n", GetProcessId(ex_child_handle), GetLastError());
+                }
+            }
+        }
+        CloseHandle(ex_child_handle);
+        CloseHandle(ex_child_thread_handle);
+        ex_child_handle = NULL;
+    }
+
   //close the pipe
   if(pipe_handle) {
 
@@ -645,6 +684,7 @@ static void run_target(char** argv) {
   if(!is_child_running()) {
     destroy_target_process(0);
     create_target_process(argv);
+    if (ext_cmdline) do_spawn_extra_process();       /* XXX: spawn extra child process immediately afterwards */
   }
 
   child_timed_out = 0;
@@ -783,6 +823,7 @@ static void usage(u8* argv0) {
        "Other settings:\n\n"
 
        "  -q            - sink program's output and don't show messages\n"
+       "  -s path       - execute specified program when creating process. substitute %%s for output file.\n"
        "  -e            - show edge coverage only, ignore hit counts\n\n"
 
        "This tool displays raw tuple data captured by AFL instrumentation.\n"
@@ -891,8 +932,9 @@ int main(int argc, char** argv) {
   optind = 1;
   dynamorio_dir = NULL;
   client_params = NULL;
+  ext_cmdline = NULL;
 
-  while ((opt = getopt(argc, argv, "+o:m:t:A:D:eqZQb")) > 0)
+  while ((opt = getopt(argc, argv, "+o:m:t:A:D:eqZQbs:")) > 0)
 
     switch (opt) {
 
@@ -998,6 +1040,11 @@ int main(int argc, char** argv) {
            similar to that dumped by afl-fuzz in <out_dir/queue/fuzz_bitmap. */
 
         binary_mode = 1;
+        break;
+
+      case 's':
+        if (ext_cmdline) FATAL("Only one extra command is supported");
+        ext_cmdline = optarg;
         break;
 
       default:

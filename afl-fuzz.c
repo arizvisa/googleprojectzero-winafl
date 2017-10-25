@@ -77,6 +77,8 @@ static u8 *in_dir,                    /* Input directory with test cases  */
           *target_cmd,                /* command line of target           */
           *orig_cmdline;              /* Original command line            */
 
+static u8* ext_cmdline;               /* other cmd to run during a fuzz run */
+
 static u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
 static u32 hang_tmout = EXEC_TIMEOUT; /* Timeout used for hang det (ms)   */
 
@@ -118,6 +120,7 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
            out_dir_fd = -1;           /* FD of the lock file              */
 
 HANDLE child_handle, child_thread_handle;
+HANDLE ex_child_handle, ex_child_thread_handle;
 char *dynamorio_dir;
 char *client_params;
 int fuzz_iterations_max, fuzz_iterations_current;
@@ -2029,6 +2032,27 @@ char *argv_to_cmd(char** argv) {
   return ret;
 }
 
+static void
+do_spawn_extra_process() {
+    char* new_cmdline = alloc_printf(ext_cmdline, out_file);
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+
+    si.cb = sizeof(si);
+
+    if (!CreateProcess(NULL, new_cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
+    }
+
+    ex_child_handle = pi.hProcess;
+    ex_child_thread_handle = pi.hThread;
+
+    ck_free(new_cmdline);
+}
+
 static void create_target_process(char** argv) {
   char* dr_cmd;
   char* pipe_name;
@@ -2176,6 +2200,22 @@ static void destroy_target_process(int wait_exit) {
     child_handle = NULL;
   }
 
+    /* wait for extra child process to terminate */
+    if(ex_child_handle) {
+        if(WaitForSingleObject(ex_child_handle, wait_exit) == WAIT_TIMEOUT) {
+            if (!TerminateProcess(ex_child_handle, 0)) {
+                WARNF("Failed while trying to terminate extra process %d. GLE=%d.\n", GetProcessId(ex_child_handle), GetLastError());
+            } else {
+                if (WaitForSingleObject(ex_child_handle, 20000) == WAIT_TIMEOUT) {
+                    WARNF("Unable to kill extra process %d. GLE=%d.\n", GetProcessId(ex_child_handle), GetLastError());
+                }
+            }
+        }
+        CloseHandle(ex_child_handle);
+        CloseHandle(ex_child_thread_handle);
+        ex_child_handle = NULL;
+    }
+
   //close the pipe
   if(pipe_handle) {
     DisconnectNamedPipe(pipe_handle); 
@@ -2235,6 +2275,7 @@ static u8 run_target(char** argv, u32 timeout) {
 
   if(!is_child_running()) {
     destroy_target_process(0);
+    if (ext_cmdline) do_spawn_extra_process();       /* XXX: spawn extra child process immediately afterwards */
 	create_target_process(argv);
 	fuzz_iterations_current = 0;
   }
@@ -2278,7 +2319,6 @@ static u8 run_target(char** argv, u32 timeout) {
 	  destroy_target_process(2000);
 	  return FAULT_CRASH;
   }
-
   destroy_target_process(0);
   return FAULT_TMOUT;
 }
@@ -6647,6 +6687,7 @@ static void usage(u8* argv0) {
 
        "  -T text       - text banner to show on the screen\n"
        "  -M \\ -S id    - distributed mode (see parallel_fuzzing.txt)\n"
+       "  -s path       - execute specified program when creating process. substitute %%s for output file.\n"
 
        "For additional tips, please consult %s\\README.\n\n",
 
@@ -7275,8 +7316,9 @@ int main(int argc, char** argv) {
   out_dir = NULL;
   dynamorio_dir = NULL;
   client_params = NULL;
+  ext_cmdline = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QD:b:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QD:b:s:")) > 0)
 
     switch (opt) {
 
@@ -7447,13 +7489,18 @@ int main(int argc, char** argv) {
 
         break;
 
+      case 's':
+        if (ext_cmdline) FATAL("Only one extra command is supported");
+        ext_cmdline = optarg;
+        break;
+
       default:
 
         usage(argv[0]);
 
     }
 
-  if (optind == argc || !in_dir || !out_dir || !dynamorio_dir || !timeout_given) usage(argv[0]);
+  if (optind == argc || !in_dir || !out_dir || !dynamorio_dir) usage(argv[0]);
 
   extract_client_params(argc, argv);
   optind++;
