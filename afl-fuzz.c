@@ -2246,7 +2246,7 @@ static void destroy_target_process(int wait_exit) {
 		ck_free(kill_cmd);
 
 		if (WaitForSingleObject(child_handle, 20000) == WAIT_TIMEOUT) {
-			FATAL("Cannot kill child process\n");
+			WARNF("Cannot kill child process\n");
 		}
 	}
 
